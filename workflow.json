@@ -1,0 +1,146 @@
+{
+  "name": "Post-Production QC Bot - Automated Video Quality Checks",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "qc-check",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-trigger",
+      "name": "Webhook Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [220, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "const body = $input.first().json.body;\nreturn [{ json: {\n  videoUrl: body.video_url || '',\n  fileName: body.file_name || 'unknown.mp4',\n  projectName: body.project_name || 'Untitled',\n  targetPlatforms: body.platforms || ['meta', 'tiktok', 'youtube_shorts'],\n  deliveryType: body.delivery_type || 'social_ad',\n  clientName: body.client_name || '',\n  dueDate: body.due_date || '',\n  notifyChannel: body.notify_channel || '#post-production'\n}}];"
+      },
+      "id": "validate-input",
+      "name": "Validate & Parse Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [440, 300]
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.videoUrl }}",
+        "options": { "response": { "response": { "responseFormat": "file" } } }
+      },
+      "id": "download-video",
+      "name": "Download Video",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [660, 300]
+    },
+    {
+      "parameters": {
+        "command": "ffprobe -v quiet -print_format json -show_format -show_streams /tmp/qc_video.mp4 2>/dev/null"
+      },
+      "id": "ffprobe-analysis",
+      "name": "FFprobe Analysis",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [880, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "const probeData = JSON.parse($input.first().json.stdout);\nconst videoStream = probeData.streams.find(s => s.codec_type === 'video') || {};\nconst audioStream = probeData.streams.find(s => s.codec_type === 'audio') || {};\nconst format = probeData.format || {};\n\nconst width = parseInt(videoStream.width || 0);\nconst height = parseInt(videoStream.height || 0);\nconst duration = parseFloat(format.duration || 0);\nconst bitrate = parseInt(format.bit_rate || 0);\nconst fps = videoStream.r_frame_rate ? eval(videoStream.r_frame_rate) : 0;\nconst codec = videoStream.codec_name || 'unknown';\nconst audioCodec = audioStream.codec_name || 'none';\nconst audioSampleRate = parseInt(audioStream.sample_rate || 0);\nconst audioChannels = parseInt(audioStream.channels || 0);\nconst audioBitrate = parseInt(audioStream.bit_rate || 0);\n\nconst aspectRatio = width > 0 && height > 0 ? (width / height).toFixed(4) : 0;\nlet aspectLabel = 'unknown';\nif (Math.abs(aspectRatio - 1.7778) < 0.01) aspectLabel = '16:9';\nelse if (Math.abs(aspectRatio - 0.5625) < 0.01) aspectLabel = '9:16';\nelse if (Math.abs(aspectRatio - 1.0) < 0.01) aspectLabel = '1:1';\nelse if (Math.abs(aspectRatio - 0.8) < 0.01) aspectLabel = '4:5';\n\nreturn [{ json: {\n  width, height, duration: Math.round(duration * 100) / 100,\n  durationFormatted: `${Math.floor(duration / 60)}:${String(Math.round(duration % 60)).padStart(2, '0')}`,\n  bitrate, bitrateKbps: Math.round(bitrate / 1000),\n  fps: Math.round(fps * 100) / 100,\n  codec, aspectRatio: parseFloat(aspectRatio), aspectLabel,\n  audioCodec, audioSampleRate, audioChannels, audioBitrate,\n  fileSize: parseInt(format.size || 0),\n  fileSizeMB: (parseInt(format.size || 0) / 1048576).toFixed(2)\n}}];"
+      },
+      "id": "extract-metadata",
+      "name": "Extract Video Metadata",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1100, 300]
+    },
+    {
+      "parameters": {
+        "command": "ffmpeg -i /tmp/qc_video.mp4 -af 'volumedetect' -f null /dev/null 2>&1 | grep -E 'mean_volume|max_volume|n_samples'"
+      },
+      "id": "audio-analysis",
+      "name": "Analyze Audio Levels",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [1100, 500]
+    },
+    {
+      "parameters": {
+        "jsCode": "const metadata = $('Extract Video Metadata').first().json;\nconst audioOutput = $('Analyze Audio Levels').first().json.stdout || '';\nconst config = $('Validate & Parse Input').first().json;\n\nconst meanMatch = audioOutput.match(/mean_volume:\\s*(-?[\\d.]+)/);\nconst maxMatch = audioOutput.match(/max_volume:\\s*(-?[\\d.]+)/);\nconst meanVolume = meanMatch ? parseFloat(meanMatch[1]) : null;\nconst maxVolume = maxMatch ? parseFloat(maxMatch[1]) : null;\n\nconst platformSpecs = {\n  meta: {\n    name: 'Meta (Facebook/Instagram)',\n    minWidth: 600, maxDuration: 241, minDuration: 1,\n    allowedAspects: ['16:9', '9:16', '1:1', '4:5'],\n    maxFileSize: 4096, minFps: 24, maxFps: 60,\n    safeZone: { top: 14, bottom: 20, left: 5, right: 5 },\n    audioRequired: true, minBitrate: 1000\n  },\n  tiktok: {\n    name: 'TikTok',\n    minWidth: 540, maxDuration: 181, minDuration: 3,\n    allowedAspects: ['9:16', '1:1'],\n    maxFileSize: 500, minFps: 24, maxFps: 60,\n    safeZone: { top: 15, bottom: 25, left: 5, right: 10 },\n    audioRequired: true, minBitrate: 516\n  },\n  youtube_shorts: {\n    name: 'YouTube Shorts',\n    minWidth: 720, maxDuration: 61, minDuration: 1,\n    allowedAspects: ['9:16'],\n    maxFileSize: 256, minFps: 24, maxFps: 60,\n    safeZone: { top: 10, bottom: 20, left: 5, right: 5 },\n    audioRequired: true, minBitrate: 1000\n  }\n};\n\nconst issues = [];\nconst warnings = [];\nconst passes = [];\n\nconfig.targetPlatforms.forEach(platform => {\n  const spec = platformSpecs[platform];\n  if (!spec) return;\n  const prefix = `[${spec.name}]`;\n\n  if (!spec.allowedAspects.includes(metadata.aspectLabel)) {\n    issues.push(`${prefix} Aspect ratio ${metadata.aspectLabel} not supported. Required: ${spec.allowedAspects.join(', ')}`);\n  } else {\n    passes.push(`${prefix} Aspect ratio ${metadata.aspectLabel} OK`);\n  }\n\n  if (metadata.width < spec.minWidth) {\n    issues.push(`${prefix} Width ${metadata.width}px below minimum ${spec.minWidth}px`);\n  } else {\n    passes.push(`${prefix} Resolution ${metadata.width}x${metadata.height} OK`);\n  }\n\n  if (metadata.duration > spec.maxDuration) {\n    issues.push(`${prefix} Duration ${metadata.durationFormatted} exceeds max ${spec.maxDuration}s`);\n  } else if (metadata.duration < spec.minDuration) {\n    issues.push(`${prefix} Duration ${metadata.durationFormatted} below minimum ${spec.minDuration}s`);\n  } else {\n    passes.push(`${prefix} Duration ${metadata.durationFormatted} OK`);\n  }\n\n  if (metadata.fileSizeMB > spec.maxFileSize) {\n    issues.push(`${prefix} File size ${metadata.fileSizeMB}MB exceeds max ${spec.maxFileSize}MB`);\n  } else {\n    passes.push(`${prefix} File size ${metadata.fileSizeMB}MB OK`);\n  }\n\n  if (metadata.fps < spec.minFps || metadata.fps > spec.maxFps) {\n    issues.push(`${prefix} Frame rate ${metadata.fps}fps outside range ${spec.minFps}-${spec.maxFps}fps`);\n  } else {\n    passes.push(`${prefix} Frame rate ${metadata.fps}fps OK`);\n  }\n\n  if (spec.audioRequired && metadata.audioCodec === 'none') {\n    issues.push(`${prefix} No audio track detected — audio required`);\n  }\n\n  if (metadata.bitrateKbps < spec.minBitrate) {\n    warnings.push(`${prefix} Bitrate ${metadata.bitrateKbps}kbps below recommended ${spec.minBitrate}kbps`);\n  }\n});\n\nif (meanVolume !== null) {\n  if (meanVolume < -24) issues.push(`[Audio] Mean volume ${meanVolume}dB too quiet (target: -16 to -14dB)`);\n  else if (meanVolume > -10) issues.push(`[Audio] Mean volume ${meanVolume}dB too loud — risk of clipping`);\n  else if (meanVolume < -18) warnings.push(`[Audio] Mean volume ${meanVolume}dB slightly quiet (ideal: -16 to -14dB)`);\n  else passes.push(`[Audio] Mean volume ${meanVolume}dB OK`);\n\n  if (maxVolume !== null && maxVolume > -1) {\n    issues.push(`[Audio] Peak volume ${maxVolume}dB — audio clipping detected`);\n  } else if (maxVolume !== null) {\n    passes.push(`[Audio] Peak volume ${maxVolume}dB — no clipping`);\n  }\n}\n\nif (metadata.codec !== 'h264' && metadata.codec !== 'hevc') {\n  warnings.push(`[Codec] Video codec ${metadata.codec} — h264 recommended for maximum compatibility`);\n}\n\nconst totalChecks = issues.length + warnings.length + passes.length;\nconst score = totalChecks > 0 ? Math.round((passes.length / totalChecks) * 100) : 0;\nconst verdict = issues.length === 0 ? 'PASS' : 'FAIL';\n\nreturn [{ json: {\n  verdict, score, issues, warnings, passes,\n  issueCount: issues.length, warningCount: warnings.length, passCount: passes.length,\n  metadata, meanVolume, maxVolume,\n  fileName: config.fileName, projectName: config.projectName,\n  platforms: config.targetPlatforms, clientName: config.clientName,\n  checkedAt: new Date().toISOString()\n}}];"
+      },
+      "id": "run-qc-checks",
+      "name": "Run Platform QC Checks",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1320, 400]
+    },
+    {
+      "parameters": {
+        "operation": "appendOrUpdate",
+        "documentId": { "__rl": true, "value": "={{ $credentials.qcLogSheetId }}" },
+        "sheetName": "QC Log",
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Date": "={{ $json.checkedAt.split('T')[0] }}",
+            "Project": "={{ $json.projectName }}",
+            "File": "={{ $json.fileName }}",
+            "Client": "={{ $json.clientName }}",
+            "Verdict": "={{ $json.verdict }}",
+            "Score": "={{ $json.score }}",
+            "Issues": "={{ $json.issues.join('; ') }}",
+            "Warnings": "={{ $json.warnings.join('; ') }}",
+            "Resolution": "={{ $json.metadata.width + 'x' + $json.metadata.height }}",
+            "Duration": "={{ $json.metadata.durationFormatted }}",
+            "Aspect": "={{ $json.metadata.aspectLabel }}",
+            "FPS": "={{ $json.metadata.fps }}",
+            "Codec": "={{ $json.metadata.codec }}",
+            "Size MB": "={{ $json.metadata.fileSizeMB }}",
+            "Audio dB": "={{ $json.meanVolume }}"
+          }
+        },
+        "options": {}
+      },
+      "id": "save-qc-log",
+      "name": "Log to QC Sheet",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [1540, 300]
+    },
+    {
+      "parameters": {
+        "channel": "={{ $('Validate & Parse Input').first().json.notifyChannel }}",
+        "text": "={{ $json.verdict === 'PASS' ? ':white_check_mark:' : ':x:' }} *QC Report: {{ $json.verdict }}* (Score: {{ $json.score }}/100)\n\n:clapper: *{{ $json.projectName }}* — `{{ $json.fileName }}`\n:calendar: {{ $json.checkedAt.split('T')[0] }}\n:desktop_computer: {{ $json.metadata.width }}x{{ $json.metadata.height }} ({{ $json.metadata.aspectLabel }}) | {{ $json.metadata.fps }}fps | {{ $json.metadata.codec }}\n:stopwatch: {{ $json.metadata.durationFormatted }} | {{ $json.metadata.fileSizeMB }}MB\n:speaker: {{ $json.meanVolume }}dB mean / {{ $json.maxVolume }}dB peak\n\n{{ $json.issues.length > 0 ? ':rotating_light: *Issues (' + $json.issueCount + '):*\\n' + $json.issues.map(i => '• ' + i).join('\\n') : ':white_check_mark: No issues found' }}\n\n{{ $json.warnings.length > 0 ? ':warning: *Warnings (' + $json.warningCount + '):*\\n' + $json.warnings.map(w => '• ' + w).join('\\n') : '' }}\n\n:checkered_flag: *{{ $json.passCount }} checks passed* across {{ $json.platforms.join(', ') }}"
+      },
+      "id": "slack-qc-report",
+      "name": "Post QC Report",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [1760, 300]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ verdict: $json.verdict, score: $json.score, issues: $json.issues, warnings: $json.warnings, passes: $json.passes, metadata: $json.metadata }) }}"
+      },
+      "id": "respond-webhook",
+      "name": "Respond to Webhook",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [1760, 500]
+    }
+  ],
+  "connections": {
+    "Webhook Trigger": { "main": [[{ "node": "Validate & Parse Input", "type": "main", "index": 0 }]] },
+    "Validate & Parse Input": { "main": [[{ "node": "Download Video", "type": "main", "index": 0 }]] },
+    "Download Video": { "main": [[{ "node": "FFprobe Analysis", "type": "main", "index": 0 }]] },
+    "FFprobe Analysis": { "main": [[{ "node": "Extract Video Metadata", "type": "main", "index": 0 }, { "node": "Analyze Audio Levels", "type": "main", "index": 0 }]] },
+    "Extract Video Metadata": { "main": [[{ "node": "Run Platform QC Checks", "type": "main", "index": 0 }]] },
+    "Analyze Audio Levels": { "main": [[{ "node": "Run Platform QC Checks", "type": "main", "index": 0 }]] },
+    "Run Platform QC Checks": { "main": [[{ "node": "Log to QC Sheet", "type": "main", "index": 0 }]] },
+    "Log to QC Sheet": { "main": [[{ "node": "Post QC Report", "type": "main", "index": 0 }, { "node": "Respond to Webhook", "type": "main", "index": 0 }]] }
+  },
+  "settings": { "executionOrder": "v1" },
+  "tags": [{ "name": "qc" }, { "name": "video" }, { "name": "post-production" }, { "name": "quality-assurance" }, { "name": "automation" }]
+}
